@@ -548,6 +548,50 @@ impl RegexSet {
         Ok(None)
     }
 
+    /// Returns which patterns match anywhere in the haystack, like `regex::RegexSet::matches`.
+    ///
+    /// ```rust
+    /// use fancy_regex::RegexSet;
+    ///
+    /// # fn main() -> Result<(), fancy_regex::Error> {
+    /// let set = RegexSet::new(&[r"\d+", r"(?<=\$)\d+", r"(?<!foo)bar"])?;
+    /// let matches = set.matches("$29 foobar")?;
+    /// assert_eq!(matches.iter().collect::<Vec<_>>(), vec![0, 1]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn matches<S: Input + ?Sized>(&self, haystack: &S) -> Result<SetMatches> {
+        let mut matched_patterns = PatternSet::new(self.regexes.len());
+        let mut candidate_patterns = PatternSet::new(self.regexes.len());
+        let overlapping_input = RaInput::new(haystack.as_bytes());
+        {
+            let mut cache_guard = self.overlapping_cache_pool.get();
+            if let Err(error) = self.overlapping_dfa.try_which_overlapping_matches(
+                &mut cache_guard,
+                &overlapping_input,
+                &mut candidate_patterns,
+            ) {
+                match error.kind() {
+                    // The DFA gave up, so fall back to trying every pattern.
+                    MatchErrorKind::Quit { .. } | MatchErrorKind::GaveUp { .. } => {
+                        for pattern_index in 0..self.regexes.len() {
+                            candidate_patterns.insert(PatternID::must(pattern_index));
+                        }
+                    }
+                    _ => panic!("unexpected overlapping DFA error: {:?}", error),
+                }
+            }
+        }
+
+        for pattern in candidate_patterns.iter() {
+            if self.regexes[pattern.as_usize()].is_match(haystack)? {
+                matched_patterns.insert(pattern);
+            }
+        }
+
+        Ok(SetMatches { matched_patterns })
+    }
+
     fn match_pattern_at_input_position<'t, S: Input + ?Sized>(
         &self,
         pattern_index: usize,
@@ -574,6 +618,26 @@ impl RegexSet {
                 pattern_index,
                 captures,
             }))
+    }
+}
+
+/// The patterns that matched, returned by [`RegexSet::matches`].
+#[derive(Clone, Debug)]
+pub struct SetMatches {
+    matched_patterns: PatternSet,
+}
+
+impl SetMatches {
+    /// Returns true if the pattern with the given index matched.
+    pub fn matched(&self, index: usize) -> bool {
+        self.matched_patterns.contains(PatternID::must(index))
+    }
+
+    /// Returns the indices of the matched patterns in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.matched_patterns
+            .iter()
+            .map(|pattern| pattern.as_usize())
     }
 }
 
@@ -1015,5 +1079,18 @@ mod tests {
             "RegexSet should behave the same as a standalone regex"
         );
         assert_eq!(single, Some((1, 2)));
+    }
+
+    #[test]
+    fn matches_returns_every_pattern_that_matches_anywhere() {
+        let set = RegexSet::new([r"\d+", r"\w+", r"\.\d+", r"(?<=\$)\d+\.\d+", r"x"]).unwrap();
+        let set_matches = set.matches("$29.99").unwrap();
+
+        assert_eq!(
+            alloc::vec![0, 1, 2, 3],
+            set_matches.iter().collect::<alloc::vec::Vec<_>>()
+        );
+        assert!(set_matches.matched(2));
+        assert!(!set_matches.matched(4));
     }
 }
